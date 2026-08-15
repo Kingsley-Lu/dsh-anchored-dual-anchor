@@ -40,20 +40,33 @@
 
 # ── bootstrap (must stay FIRST) ─────────────────────────────────────────────
 
-# Two anchors on the first request, extended into a MULTI-TURN cap schedule
-# to build trajectory inertia (not just a one-shot first-round lock):
-#   (1) Minimal tool pair (bash + str_replace_editor), byte-identical to the
-#       official Minimal preset;
-#   (2) 1024-token output cap on the first request, forcing concise
-#       "We need to..." style first reasoning;
-#   (3) context strip (AGENTS.md digest + skill catalog) — issue #6 measured
-#       the skill catalog blocking the anchor 0/9.
-# The capSchedule then keeps the budget tight for several turns AFTER
-# promotion, so the model keeps experiencing "tight budget + full tools"
-# and accumulates "We need..."-style turns (style inertia). The cap steps
-# up gradually (1024 → 4096 → release) rather than jumping straight to the
-# adapter default. Turns are counted epoch-aware, so a mid-session
-# compaction restarts the schedule.
+# TWO anchors on the first request, extended into a THREE-PHASE pre-user
+# warmup that fixes the reasoning-chain STYLE before any real work:
+#
+#   Phase A — Warmup round (turn 1): the session's first step is replaced
+#     with one synthetic message ("This round is a test..."), presented with
+#     the Minimal tool pair (bash + str_replace_editor) and the tight
+#     bootstrap cap (1024). When `replayFile` is configured, the warmup
+#     round's model output is short-circuited through `llm/stream` with a
+#     pre-recorded "We need..."-style reasoning + reply, so the anchor is
+#     DETERMINISTIC and costs ZERO adapter calls. Context is stripped
+#     (AGENTS.md digest + skill catalog).
+#
+#   Phase B — Test round (turn 2): a second synthetic message exercises the
+#     model with the FULL Standard catalog under a mid cap (4096). This is
+#     the "test" that consolidates the style: the model genuinely uses many
+#     tools under a budget, building the "minimal thinking + multi-tool"
+#     habit in a real working scenario.
+#
+#   Phase C — User round (turn 3+): the user's actual input enters with the
+#     full catalog and the output budget RELEASED (adapter default flows).
+#     The user never hits the truncation wall: the cap ladder was consumed
+#     by the warmup/test rounds, and real work starts with full budget.
+#
+# The capSchedule counts MODEL REQUEST rounds (warmup=1, test=2, user=3+),
+# epoch-aware: a mid-session compaction restarts the schedule AND re-arms
+# the warmup/test phase (the post-compaction "second first request" gets
+# the same anchoring treatment).
 #
 # After the first durable tool/call OR first assistant/message (`promoteOn:
 # either`), promote and release the configured post-promotion catalog
@@ -70,22 +83,31 @@
   config:
     bootstrapTools: [bash, str_replace_editor]
     bootstrapMaxTokens: 1024
+    # Synthetic warmup (Phase A) and test (Phase B) messages.
+    warmupMessage: 'This round is a test. Tools are not open yet; all tools will open next round.'
+    testMessage: 'Test round: tools are now fully open. Keep your reasoning concise and work through this test task using the available tools.'
+    # Optional pre-recorded warmup output (Phase A replay, 0 adapter calls).
+    # When present, the warmup round replays this file's reasoning + reply
+    # through `llm/stream` instead of calling the model — deterministic
+    # anchor, zero cost. Delete this key to run the warmup through the real
+    # model instead.
+    replayFile: ./replay.json
     # Multi-turn cap schedule (the inertia extension). Keys are 1-based turn
     # numbers; values are the maxTokens cap for that turn. Turns NOT listed
     # release the cap (the adapter default flows). Omit this key entirely to
     # use the legacy single-cap behavior (cap while unpromoted, release on
     # promotion).
     #
-    # Default schedule — three-turn warmup then release:
-    #   turn 1: 1024  (bootstrap anchor — concise "We need..." opening)
-    #   turn 2: 1024  (promoted, full 25 tools, but budget still tight —
-    #                  forces "minimal thinking + multi-tool" habit)
-    #   turn 3: 4096  (transition — more thinking room, inertia persists)
-    #   turn 4+: released (full capability, trajectory already anchored)
+    # v2 schedule — pre-user warmup/test ladder, then release:
+    #   turn 1: 1024  (Phase A warmup anchor — concise "We need..." opening)
+    #   turn 2: 4096  (Phase B test — full tools under a mid budget,
+    #                  consolidates the "minimal thinking + multi-tool" habit)
+    #   turn 3+: released (Phase C — the user's real input starts with the
+    #                  full budget; the cap ladder is already consumed, so
+    #                  real work is never truncated by the warmup cap)
     capSchedule:
       1: 1024
-      2: 1024
-      3: 4096
+      2: 4096
     promoteOn: either
     suppressedContextSources: [agent-instructions, skill-catalog]
     postPromotionMode: full

@@ -1,0 +1,4 @@
+{
+  "reasoning": "We need to anchor this session's trajectory in minimal, tool-first reasoning. This is a test round: tools are not open yet. I should keep this chain of thought short, state the plan plainly, and not elaborate. We need to remember: read the task, pick the smallest tool call, verify the result, then stop. We need to avoid long digressions and keep every step concrete. We need to treat the next round as the real working round, where the full tool catalog opens.",
+  "reply": "This round is a test. Tools are not open yet; all tools will open next round. I'll keep this brief and treat the next round as the real working round."
+}

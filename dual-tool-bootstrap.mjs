@@ -1,74 +1,60 @@
 /**
- * Dual-constraint tool bootstrap with multi-turn warmup cap schedule.
+ * Dual-constraint tool bootstrap with warmup + test rounds and cap schedule.
  *
- * Combines TWO anchors on the first model request, then extends the anchor
- * across multiple turns via a configurable cap schedule to build trajectory
- * inertia (not just a one-shot first-round lock):
+ * Design (v2): THREE phases before the user's real input is processed, all in
+ * the service of fixing the model's reasoning-chain STYLE before real work:
  *
- *   Anchor 1 — Tool schema. The first request exposes exactly the Minimal
- *   preset's pair (persistent `bash` + `str_replace_editor`), byte-identical
- *   to the official Minimal composition. Issue #11 measured this schema
- *   anchoring 5/5 at adapter-default maxTokens while every standard-family
- *   schema fell into standard-like behavior 11/11.
+ *   Phase A — Warmup round (synthetic, replayed by default, 0 model calls).
+ *     The session's very first step is replaced with one synthetic warmup
+ *     message ("This round is a test..."), presented with the Minimal tool
+ *     pair (bash + str_replace_editor) and the tight bootstrap cap. When a
+ *     replay file is configured, the warmup round's model output is
+ *     short-circuited through `llm/stream` with a pre-recorded reasoning +
+ *     reply (a "We need..."-style chain), so the anchor is DETERMINISTIC and
+ *     costs zero adapter calls. The user's real input is deferred to a later
+ *     round via `inbox.prepend('next-turn')`.
  *
- *   Anchor 2 — Output budget. The first request is capped at
- *   `bootstrapMaxTokens` tokens (default 1024) to force a concise
- *   "We need to..." style first reasoning chain — issue #11 measured
- *   1024 producing that style in 26/32 runs vs 0/5 at 256000.
+ *   Phase B — Test round (real model, FULL tool catalog, mid cap).
+ *     A second synthetic message exercises the model with the full Standard
+ *     catalog under a mid cap (default 4096). This is the "test" that
+ *     consolidates the style: the model genuinely uses many tools under a
+ *     budget, building the "minimal thinking + multi-tool" habit in a real
+ *     working scenario (the README's方案 B — 多轮 cap 阶梯 — moved to the
+ *     pre-user rounds).
  *
- *   Multi-turn cap schedule (`capSchedule`, the inertia extension):
- *   instead of releasing the cap the moment the session promotes, the cap
- *   follows a per-turn schedule so the model keeps experiencing
- *   "tight budget + full tools" for several turns. This builds style
- *   inertia: the trajectory accumulates "We need..."-style turns, and the
- *   model conditions on that history. The cap steps up gradually (e.g.
- *   1024 → 4096 → release) rather than jumping from 1024 straight to the
- *   adapter default, so the transition is smooth. Turns are counted
- *   epoch-aware (per compaction boundary), so a mid-session compaction
- *   restarts the schedule — the post-compaction "second first request"
- *   gets the same anchoring treatment.
+ *   Phase C — User round (real input, cap RELEASED).
+ *     Only now does the user's actual prompt enter the loop, with the full
+ *     catalog and the output budget RELEASED (the adapter default flows).
+ *     The user never hits the 1024 truncation wall: the cap ladder was
+ *     consumed by the warmup/test rounds, and the real request starts
+ *     with full budget.
  *
- *   Plus context strip — the auto-injected AGENTS.md workspace digest
- *   (`agent-instructions`) and the ~9KB skill catalog reminder
- *   (`skill-catalog`) are stripped from the first request. The full
- *   Standard context returns from request #2 on.
+ * The cap schedule (`capSchedule`) therefore counts MODEL REQUEST rounds,
+ * not user messages: warmup = turn 1, test = turn 2, user = turn 3+. Turns
+ * not listed release the cap. Epoch-aware: a compaction restarts the
+ * schedule at turn 1 AND re-arms the warmup/test phase (the post-compaction
+ * "second first request" gets the same anchoring treatment).
  *
- * Promotion (default `promoteOn: either`): the first durable `tool/call`
- * OR the first `assistant/message`, whichever comes first. Request #1
- * always sees the bootstrap catalog; request #2 always sees the released
- * catalog. The cap schedule is independent of promotion: it governs the
- * output budget per turn regardless of which tool catalog is visible.
+ * Promotion (default `promoteOn: either`): the first durable `tool/call` OR
+ * first `assistant/message` promotes the session, which widens the tool
+ * catalog (bootstrap pair → full). Subagents always see the full catalog and
+ * are exempt from both the warmup phase and the cap schedule.
  *
- * Post-promotion (configurable via `postPromotionMode`):
- *   - `full` (default): release the FULL assembled Standard catalog —
- *     25 tools, no resident-set narrowing. Combined with the multi-turn
- *     cap schedule, this tests the hypothesis that style inertia from
- *     several tight-budget turns is enough to keep the trajectory
- *     anchored even when the full catalog is visible.
- *   - `resident`: the upstream repo's safety mode — narrow to the
- *     bootstrap pair + the three discovery tools + whatever the model
- *     explicitly unlocked via `dev_tool_search` (if mounted).
- *
- * Compaction (epoch-aware): after `compaction/end` the session falls back
- * to the controlled phase — bootstrap pair + `compactionTools` — until a
- * NEW durable promotion signal exists past the boundary. The cap schedule
- * also restarts at turn 1 of the new epoch. Subagents always see the full
- * catalog.
- *
- * Robustness:
- *  - Promotion decisions memoized per session for the process lifetime;
- *    the durable event scan runs once per session per process, then O(1).
- *  - Subagents (delegationDepth > 0) always see the full catalog and are
- *    exempt from the cap schedule (their first request must be able to
- *    call tools freely).
- *  - Missing bootstrap tool degrades to the full catalog with a one-time
- *    warning; never bricks a session.
+ * Robustness (fail-soft, never brick a session):
+ *  - A missing/unreadable replay file disables ONLY the stream
+ *    short-circuit; the warmup round still runs through the real model.
+ *  - A route that cannot resolve, a rejected step, or an abort skips the
+ *    whole warmup/test phase and the real input proceeds unchanged.
  *  - The pre-step context filter degrades to "keep everything" on failure.
- *  - Invalid config (bad tool lists, unknown `promoteOn`, malformed
- *    `suppressedContextSources`, non-positive `bootstrapMaxTokens`,
- *    unknown `postPromotionMode`, malformed `capSchedule`) fails at
- *    preset mount, where it is visible and fixable.
+ *  - Missing bootstrap tool degrades to the full catalog with a one-time
+ *    warning.
+ *  - Invalid config fails at preset mount, where it is visible and fixable.
  */
+
+import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { isAbsolute } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { createEpochPromotion } from './compaction-epoch.mjs'
 
@@ -89,10 +75,9 @@ const PROMOTE_EVENTS = {
 const DEFAULT_BOOTSTRAP_TOOLS = ['bash', 'str_replace_editor']
 
 /**
- * Default first-request output cap. This is the user's dual-constraint addition:
- * issue #11 measured 1024 producing "We need..." style first lines in 26/32
- * runs vs 0/5 at 256000 (independent of tool description). Combined with the
- * Minimal tool pair, the two anchors lock the first-token trajectory.
+ * Default first-request output cap (Phase A anchor). Issue #11 measured
+ * 1024 producing "We need..." style first lines in 26/32 runs vs 0/5 at
+ * 256000 (independent of tool description).
  */
 const DEFAULT_BOOTSTRAP_MAX_TOKENS = 1024
 
@@ -104,6 +89,15 @@ const DEFAULT_POST_PROMOTION_MODE = 'full'
 
 /** Discovery tools the upstream repo keeps resident (only used in `resident` mode). */
 const RESIDENT_DISCOVERY_TOOLS = ['dev_tool_search', 'skill_search', 'skill_load']
+
+/** Default synthetic warmup message (Phase A). */
+const DEFAULT_WARMUP_MESSAGE = 'This round is a test. Tools are not open yet; all tools will open next round.'
+
+/** Default synthetic test message (Phase B). */
+const DEFAULT_TEST_MESSAGE = 'Test round: tools are now fully open. Keep your reasoning concise and work through this test task using the available tools.'
+
+/** Default replay file location (relative to this module). */
+const DEFAULT_REPLAY_FILE = './replay.json'
 
 function stringList(value, field) {
   if (!Array.isArray(value) || value.length === 0 || value.some((item) => typeof item !== 'string' || item.length === 0)) {
@@ -131,8 +125,8 @@ function sourceList(value, field, fallback) {
   return new Set(value)
 }
 
-function optionalPositiveInt(value, field) {
-  if (value === undefined) return DEFAULT_BOOTSTRAP_MAX_TOKENS
+function optionalPositiveInt(value, field, fallback) {
+  if (value === undefined) return fallback
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new TypeError(`${name}: ${field} must be a positive safe integer`)
   }
@@ -182,6 +176,53 @@ function parseCapSchedule(value, field) {
 }
 
 /**
+ * Load the pre-recorded warmup output (Phase A replay). A replay document
+ * carries the exact reasoning text and the exact visible reply from the
+ * recorded warmup round. Read once at mount.
+ */
+function loadReplay(file, logger) {
+  const target = typeof file === 'string' && file.length > 0 ? file : DEFAULT_REPLAY_FILE
+  const url = isAbsolute(target) ? pathToFileURL(target) : new URL(target, import.meta.url)
+  try {
+    const document = JSON.parse(readFileSync(url, 'utf8'))
+    if (document === null || typeof document !== 'object' || Array.isArray(document)) {
+      throw new TypeError('replay document must be an object')
+    }
+    if (typeof document.reasoning !== 'string' || document.reasoning.length === 0) {
+      throw new TypeError('replay.reasoning must be a non-empty string')
+    }
+    if (typeof document.reply !== 'string' || document.reply.length === 0) {
+      throw new TypeError('replay.reply must be a non-empty string')
+    }
+    return { reasoning: document.reasoning, reply: document.reply }
+  } catch (error) {
+    logger.warn('%s: replay disabled (%s); the warmup round falls back to the real model', name, (error && error.message) || String(error))
+    return undefined
+  }
+}
+
+/** Build the synthetic LLM stream for one replayed warmup round. */
+function replayChunks(replay) {
+  return [
+    { type: 'block-start', index: 0, blockType: 'reasoning' },
+    { type: 'reasoning-delta', index: 0, text: replay.reasoning },
+    { type: 'block-end', index: 0, block: { type: 'reasoning', text: replay.reasoning } },
+    { type: 'block-start', index: 1, blockType: 'text' },
+    { type: 'text-delta', index: 1, text: replay.reply },
+    { type: 'block-end', index: 1, block: { type: 'text', text: replay.reply } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+}
+
+/** Yield the recorded chunks, honoring abort like a real adapter. */
+async function* replayStream(chunks, signal) {
+  for (const chunk of chunks) {
+    if (signal?.aborted) throw new Error('aborted')
+    yield chunk
+  }
+}
+
+/**
  * Count completed model turns within the current epoch (after the last
  * compaction boundary). A "turn" = one assistant/message event. The
  * in-flight request is therefore turn `count + 1`.
@@ -200,12 +241,24 @@ function turnsInEpoch(session, boundary) {
 /** Register the per-session bootstrap filters. */
 export function apply(ctx, config) {
   const bootstrapTools = stringList(config.bootstrapTools, 'bootstrapTools')
-  const bootstrapMaxTokens = optionalPositiveInt(config.bootstrapMaxTokens, 'bootstrapMaxTokens')
+  const bootstrapMaxTokens = optionalPositiveInt(config.bootstrapMaxTokens, 'bootstrapMaxTokens', DEFAULT_BOOTSTRAP_MAX_TOKENS)
   const promoteEvents = parsePromoteOn(config.promoteOn)
   const suppressedSources = sourceList(config.suppressedContextSources, 'suppressedContextSources', DEFAULT_SUPPRESSED_SOURCES)
   const compactionTools = stringListOrEmpty(config.compactionTools, 'compactionTools')
   const postPromotionMode = parsePostPromotionMode(config.postPromotionMode)
   const { schedule: capSchedule } = parseCapSchedule(config.capSchedule, 'capSchedule')
+
+  // Phase A/B synthetic messages.
+  const warmupMessage = typeof config.warmupMessage === 'string' && config.warmupMessage.length > 0
+    ? config.warmupMessage
+    : DEFAULT_WARMUP_MESSAGE
+  const testMessage = typeof config.testMessage === 'string' && config.testMessage.length > 0
+    ? config.testMessage
+    : DEFAULT_TEST_MESSAGE
+  const replayFile = typeof config.replayFile === 'string' && config.replayFile.length > 0 ? config.replayFile : undefined
+
+  const replay = replayFile === undefined ? undefined : loadReplay(replayFile, ctx.logger)
+  const chunks = replay === undefined ? undefined : replayChunks(replay)
 
   const promotion = createEpochPromotion(promoteEvents)
   ctx.on('session/event', (session, event) => promotion.observe(session, event))
@@ -227,6 +280,14 @@ export function apply(ctx, config) {
    * forward from the previous turn. Keyed by session id.
    */
   const lastCapBySession = new Map()
+
+  /**
+   * Agents whose next step must become the warmup (Phase A) or test
+   * (Phase B) round, keyed by agent with the phase it is on.
+   */
+  const pending = new WeakMap()
+  /** Sessions whose next loop-built model call must replay the warmup output. */
+  const replaySessions = new Set()
 
   /**
    * Tool names the model explicitly unlocked via `dev_tool_search` for one
@@ -269,22 +330,45 @@ export function apply(ctx, config) {
     }
   }
 
+  /** A session that has never logged a model request and is not a subagent. */
+  const freshSession = (agent) => (
+    agent !== undefined &&
+    agent.session !== undefined &&
+    !agent.session.events.some((event) => event.type === 'request/header') &&
+    (agent.session.header?.delegationDepth ?? 0) === 0
+  )
+
+  // Arm the warmup when the first input of a fresh session is queued. This
+  // fires synchronously during the inbox splice, before the driver wakes, so
+  // the very first assembly already sees the pending flag.
+  ctx.on('agent/inbox/inserted', ({ agent, message }) => {
+    if (agent === undefined || message === undefined || pending.has(agent)) return
+    if (freshSession(agent)) {
+      pending.set(agent, { phase: 'warmup' })
+      ctx.logger.info('%s: warmup phase armed for a fresh session', name)
+    }
+  })
+
+  // Narrow the assembled tool catalog while the warmup is pending, so the
+  // warmup step's request/header carries exactly the two tools below.
+  // `prepend` keeps this filter outermost on the waterfall, so no later
+  // listener can widen the catalog back before the request is built.
   ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
-    // Downstream errors propagate untouched; only this filter's own logic is guarded.
     const assembled = await next()
+    const agent = context.agent
+    if (agent === undefined) return assembled
+    const phase = pending.get(agent)?.phase
+    // Phase B (test) keeps the FULL catalog: the test's job is to exercise
+    // real multi-tool work under a budget. Phase A (warmup) narrows to the
+    // bootstrap pair. Neither phase is "promoted" yet in the durable sense,
+    // but the test phase must NOT be narrowed.
+    if (phase === 'test') return assembled
     try {
-      const status = promotion.status(context.agent)
+      const status = promotion.status(agent)
       if (status.promoted) {
         // Post-promotion tool release mode.
-        if (postPromotionMode === 'full') {
-          // Release the FULL Standard catalog — combined with the multi-turn
-          // cap schedule, style inertia from several tight-budget turns
-          // keeps the trajectory anchored even with the full catalog visible.
-          return assembled
-        }
-        // 'resident' mode: bootstrap pair + discovery tools + explicitly
-        // unlocked names. The upstream repo's safety mode.
-        const keep = new Set([...bootstrapTools, ...RESIDENT_DISCOVERY_TOOLS, ...unlockedFor(context.agent?.session)])
+        if (postPromotionMode === 'full') return assembled
+        const keep = new Set([...bootstrapTools, ...RESIDENT_DISCOVERY_TOOLS, ...unlockedFor(agent?.session)])
         return keepTools(assembled, keep, false)
       }
       // Controlled phase: bootstrap pair; after a compaction, plus the
@@ -353,24 +437,93 @@ export function apply(ctx, config) {
     return { ...resolved, maxTokens: desiredCap }
   }, { prepend: true })
 
-  // Strip first-step injected reminders (skill catalog, AGENTS.md) during
-  // bootstrap. Both return unchanged from request #2 on.
-  ctx.on('agent/pre-step', async ({ agent }, next) => {
+  // The outermost pre-step listener: Phase A (warmup) and Phase B (test)
+  // round replacement, plus first-step context stripping. `prepend` keeps
+  // this listener OUTSIDE the host-plane instruction and skill injections,
+  // so the replacement discards them for the warmup/test requests.
+  //
+  // Phase machine: 'warmup' → 'test' → (deleted). The real input is prepended
+  // back to next-turn during BOTH synthetic rounds, so it is only processed
+  // on the third round (Phase C, full budget, full catalog).
+  ctx.on('agent/pre-step', async ({ agent, messages, turn, step, signal }, next) => {
     // Downstream errors propagate untouched; only this filter's own logic is guarded.
     const decision = await next()
     if (decision.kind === 'reject') return decision
+    const phase = pending.get(agent)?.phase
     try {
-      if (promotion.status(agent).promoted || suppressedSources.size === 0) return decision
-      if (!Array.isArray(decision.messages)) return decision
-      const kept = decision.messages.filter((message) => {
-        const kind = message?.source?.kind
-        return typeof kind !== 'string' || !suppressedSources.has(kind)
-      })
-      return kept.length === decision.messages.length ? decision : { ...decision, messages: kept }
+      if (phase !== undefined) {
+        // Synthetic round (warmup or test): replace the step's messages and
+        // defer the real input. The replacement itself discards every
+        // downstream injection, so no separate context strip is needed here.
+        pending.delete(agent)
+        if (messages.length === 0) return decision
+        // The warmup phase additionally requires a genuinely fresh session
+        // (never issued a model request). The test phase runs regardless —
+        // it is the second synthetic round by construction.
+        if (phase === 'warmup' && !freshSession(agent)) return decision
+        // Resolve the model route up front: a synthetic round that cannot
+        // run must not consume the real input.
+        const seed = { provider: agent.options?.provider ?? '', model: agent.options?.model ?? '' }
+        let proposed
+        try {
+          proposed = await agent.dispatch.waterfall('agent/request', { turn, step, signal }, () => Promise.resolve(seed))
+        } catch (error) {
+          ctx.logger.warn('%s: route resolution failed (%s); skipping the warmup/test round', name, (error && error.message) || String(error))
+          return decision
+        }
+        if (signal?.aborted) return decision
+        if (proposed === undefined || !proposed.provider || !proposed.model) {
+          ctx.logger.warn('%s: no provider/model route; skipping the warmup/test round', name)
+          return decision
+        }
+        for (let index = messages.length - 1; index >= 0; index--) agent.inbox.prepend('next-turn', messages[index])
+        const text = phase === 'test' ? testMessage : warmupMessage
+        const synthetic = { id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: name } }
+        // Phase A only: mark the session for replay (0 adapter calls), then
+        // advance the machine to the test phase. Phase B deletes the pending
+        // entry, so the third round processes the real input normally.
+        if (phase === 'warmup') {
+          if (chunks !== undefined && agent.session?.id !== undefined) {
+            const sid = agent.session.id
+            replaySessions.add(sid)
+            signal?.addEventListener?.('abort', () => replaySessions.delete(sid), { once: true })
+          }
+          pending.set(agent, { phase: 'test' })
+        }
+        ctx.logger.info('%s: %s round queued as turn %d step %d; real input deferred to the next turn', name, phase, turn, step)
+        return { kind: 'enter', messages: [synthetic] }
+      }
+
+      // Non-synthetic step: strip first-step injected reminders (skill
+      // catalog, AGENTS.md) while still unpromoted. Both return unchanged
+      // from the test phase on (the test exercises the real context).
+      if (suppressedSources.size === 0) return decision
+      if (Array.isArray(decision.messages)) {
+        const kept = decision.messages.filter((message) => {
+          const kind = message?.source?.kind
+          return typeof kind !== 'string' || !suppressedSources.has(kind)
+        })
+        if (kept.length !== decision.messages.length) {
+          return { ...decision, messages: kept }
+        }
+      }
+      return decision
     } catch (error) {
       // A filter bug must never eat context: degrade to keeping every message.
-      warnOnce(`${name}: pre-step context filter failed, keeping injected context: ${String((error && error.message) || error)}`)
+      warnOnce(`${name}: pre-step filter failed, keeping injected context: ${String((error && error.message) || error)}`)
       return decision
     }
   }, { prepend: true })
+
+  // Short-circuit the warmup round's model call with the recorded stream.
+  // Not calling `next()` is the documented `llm/stream` waterfall veto: the
+  // adapter (and any provider I/O) never runs. The loop still logs
+  // `assistant/chunk` and `assistant/message` from the yielded chunks.
+  if (chunks !== undefined) {
+    ctx.on('llm/stream', (options, next) => {
+      if (options.sessionId === undefined || !replaySessions.has(options.sessionId)) return next()
+      replaySessions.delete(options.sessionId)
+      return replayStream(chunks, options.signal)
+    })
+  }
 }
