@@ -84,7 +84,9 @@
     bootstrapTools: [bash, str_replace_editor]
     bootstrapMaxTokens: 1024
     # Synthetic warmup (Phase A) and test (Phase B) messages.
-    warmupMessage: 'This round is a test. Tools are not open yet; all tools will open next round.'
+    # Phase A message MUST match the message that produced replay.json — the
+    # replayed reasoning/reply were recorded against this exact prompt.
+    warmupMessage: 'I will giving you a hard question later you need prepare now ,,therefore warm up yourself in your COT.Please thinking **Longer as possible**.List the points to remind yourself would be better.'
     testMessage: 'Test round: tools are now fully open. Keep your reasoning concise and work through this test task using the available tools.'
     # Optional pre-recorded warmup output (Phase A replay, 0 adapter calls).
     # When present, the warmup round replays this file's reasoning + reply
