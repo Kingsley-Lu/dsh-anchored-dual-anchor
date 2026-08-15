@@ -1,0 +1,3 @@
+name: Dual-Constraint Warmup Standard (experimental)
+description: Two constraints on the first request (Minimal tool pair + 1024-token cap) plus context stripping, then a multi-turn warmup cap schedule (1024/1024/4096/release) that builds trajectory inertia before the full Standard tool catalog is released.
+order: 6

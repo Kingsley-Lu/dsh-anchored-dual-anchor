@@ -1,0 +1,14 @@
+{
+  "name": "dsh-dual-constraint-warmup-standard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH preset: dual constraint (Minimal tool pair + 1024 cap) on the first request, then a multi-turn warmup cap schedule that builds trajectory inertia before releasing the full Standard catalog.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "check": "node --check dual-tool-bootstrap.mjs && node --check compaction-epoch.mjs && node --check custom-bash.mjs"
+  }
+}
